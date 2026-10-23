@@ -143,12 +143,34 @@ bore_public_address() {
 
 start_bore() {
   local logfile=/tmp/bore.log addr i
-  : > "$logfile"
   local args=(local "$SSH_PORT" --local-host 127.0.0.1 --to "$BORE_SERVER")
   [ -n "$BORE_SECRET" ] && args+=(--secret "$BORE_SECRET")
-  [ -n "$BORE_REMOTE_PORT" ] && args+=(--port "$BORE_REMOTE_PORT")
-  NO_COLOR=1 "$BORE_BIN" "${args[@]}" >> "$logfile" 2>&1 &
-  BORE_PID=$!
+
+  # A fixed public port keeps the ssh command stable across restarts; if the
+  # server says it is taken, fall back to any free port instead of looping.
+  if [ -n "$BORE_REMOTE_PORT" ]; then
+    : > "$logfile"
+    NO_COLOR=1 "$BORE_BIN" "${args[@]}" --port "$BORE_REMOTE_PORT" >> "$logfile" 2>&1 &
+    BORE_PID=$!
+    for i in $(seq 1 8); do
+      addr="$(bore_public_address "$logfile")"
+      [ -n "$addr" ] && break
+      kill -0 "$BORE_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if [ -z "$addr" ]; then
+      log "[bore] port $BORE_REMOTE_PORT is not free — asking for any port instead"
+      kill "$BORE_PID" 2>/dev/null
+      BORE_PID=""
+    fi
+  fi
+
+  if [ -z "$BORE_PID" ]; then
+    : > "$logfile"
+    NO_COLOR=1 "$BORE_BIN" "${args[@]}" >> "$logfile" 2>&1 &
+    BORE_PID=$!
+  fi
+
   for i in $(seq 1 20); do
     addr="$(bore_public_address "$logfile")"
     if [ -n "$addr" ]; then
