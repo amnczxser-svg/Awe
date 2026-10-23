@@ -20,7 +20,12 @@
 #                              address is printed to the log
 #    BORE_SERVER               tunnel server                 (default bore.pub)
 #    BORE_SECRET               optional secret the server may require
-#    BORE_REMOTE_PORT          ask for a fixed public port    (default: random)
+#    BORE_REMOTE_PORT          preferred fixed public port (default: random).
+#                              If the preferred port is taken bore picks a free
+#                              one and the actually-used port is saved back here
+#                              (via $BORE_PORT_FILE) so later restarts reuse it.
+#    BORE_PORT_FILE            where the last-used port is kept
+#                              (default $PROJECT_DIR/.bore_remote_port)
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -34,6 +39,11 @@ BORE_BIN="${BORE_BIN:-bore}"
 BORE_SERVER="${BORE_SERVER:-bore.pub}"
 BORE_SECRET="${BORE_SECRET:-}"
 BORE_REMOTE_PORT="${BORE_REMOTE_PORT:-}"
+BORE_PORT_FILE="${BORE_PORT_FILE:-${PROJECT_DIR}/.bore_remote_port}"
+# Optional: if set, the script self-syncs BORE_REMOTE_PORT on the platform when
+# it changes, so the app's Environment tab always shows the port actually in use.
+BLITZ_API_KEY="${BLITZ_API_KEY:-}"
+BLITZ_APP="${BLITZ_APP:-}"
 
 DATA_DIR="${OPENCODE_DATA_DIR:-/root/.local/share/opencode}"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/root/.config/opencode}"
@@ -120,16 +130,36 @@ bore_public_address() {
     | grep -oE 'listening at [^ ]+:[0-9]+' | tail -1 | awk '{print $3}'
 }
 
+# Push the actual port back to the platform's BORE_REMOTE_PORT setting so the
+# app's Environment tab stays in sync even after a fallback to a random port.
+bore_sync_platform_port() {
+  local port="$1"
+  [ -n "$BLITZ_API_KEY" ] && [ -n "$BLITZ_APP" ] || return 0
+  curl -sS --max-time 15 -X POST "https://mcp.blitz.cloud/cli" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Authorization: Bearer ${BLITZ_API_KEY}" \
+    -H "Mcp-Protocol-Version: 2025-06-18" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"env_set\",\"arguments\":{\"app\":\"${BLITZ_APP}\",\"name\":\"BORE_REMOTE_PORT\",\"value\":\"${port}\"}}}" \
+    >/dev/null 2>&1
+}
+
 start_bore() {
-  local logfile=/tmp/bore.log addr i
+  local logfile=/tmp/bore.log addr i actual requested
   local args=(local "$SSH_PORT" --local-host 127.0.0.1 --to "$BORE_SERVER")
   [ -n "$BORE_SECRET" ] && args+=(--secret "$BORE_SECRET")
 
-  # A fixed public port keeps the ssh command stable across restarts; if the
-  # server says it is taken, fall back to any free port instead of looping.
-  if [ -n "$BORE_REMOTE_PORT" ]; then
+  # Preferred port: env override, else the last one we actually got (persisted),
+  # else leave it empty to let bore pick any free port.
+  requested="$BORE_REMOTE_PORT"
+  if [ -z "$requested" ] && [ -n "$BORE_PORT_FILE" ] && [ -f "$BORE_PORT_FILE" ]; then
+    requested="$(cat "$BORE_PORT_FILE" 2>/dev/null | tr -dc '0-9')"
+  fi
+
+  # Try the requested fixed port first.
+  if [ -n "$requested" ]; then
     : > "$logfile"
-    NO_COLOR=1 "$BORE_BIN" "${args[@]}" --port "$BORE_REMOTE_PORT" >> "$logfile" 2>&1 &
+    NO_COLOR=1 "$BORE_BIN" "${args[@]}" --port "$requested" >> "$logfile" 2>&1 &
     BORE_PID=$!
     for i in $(seq 1 8); do
       addr="$(bore_public_address "$logfile")"
@@ -137,29 +167,47 @@ start_bore() {
       kill -0 "$BORE_PID" 2>/dev/null || break
       sleep 1
     done
-    if [ -z "$addr" ]; then
-      log "[bore] port $BORE_REMOTE_PORT is not free — asking for any port instead"
+    if [ -n "$addr" ] && [ "${addr##*:}" = "$requested" ]; then
+      actual="$requested"
+    else
+      log "[bore] requested port $requested is not free — asking for any free port instead"
       kill "$BORE_PID" 2>/dev/null
       BORE_PID=""
+      # "No" a stale requested port so the random path below does not redo this.
+      requested=""
     fi
   fi
 
-  if [ -z "$BORE_PID" ]; then
+  # Random port fallback (no preferred port, or the preferred one was taken).
+  if [ -z "$requested" ]; then
     : > "$logfile"
     NO_COLOR=1 "$BORE_BIN" "${args[@]}" >> "$logfile" 2>&1 &
     BORE_PID=$!
+    for i in $(seq 1 20); do
+      addr="$(bore_public_address "$logfile")"
+      [ -n "$addr" ] && break
+      kill -0 "$BORE_PID" 2>/dev/null || break
+      sleep 1
+    done
   fi
 
-  for i in $(seq 1 20); do
-    addr="$(bore_public_address "$logfile")"
-    if [ -n "$addr" ]; then
-      log "[bore] ssh: ssh -p ${addr##*:} ${SSH_USERNAME:-root}@${addr%:*}"
-      log "[bore] that port is on the open internet — use a long password or keys"
-      return 0
+  if [ -n "$addr" ]; then
+    actual="${addr##*:}"
+    # Keep the port we actually got so later restarts reuse the same one while it
+    # stays free, instead of getting a new random port every time.
+    if [ "$actual" != "$BORE_REMOTE_PORT" ]; then
+      BORE_REMOTE_PORT="$actual"
+      if [ -n "$BORE_PORT_FILE" ]; then
+        mkdir -p "$(dirname "$BORE_PORT_FILE")" 2>/dev/null
+        printf '%s\n' "$actual" > "$BORE_PORT_FILE" 2>/dev/null
+      fi
+      bore_sync_platform_port "$actual"
     fi
-    kill -0 "$BORE_PID" 2>/dev/null || break
-    sleep 1
-  done
+    log "[bore] ssh: ssh -p $actual ${SSH_USERNAME:-root}@${addr%:*}"
+    log "[bore] using fixed port $actual (kept across restarts while it stays free)"
+    return 0
+  fi
+
   log "[bore] could not open a tunnel to $BORE_SERVER — see $logfile"
   BORE_PID=""
   return 1
@@ -168,11 +216,17 @@ start_bore() {
 # ── Optional SSH ─────────────────────────────────────────
 if [ "$ENABLE_SSH" = "1" ]; then
   [ -x /usr/sbin/sshd ] || fail "ENABLE_SSH=1 but /usr/sbin/sshd is missing from the image"
-  [ -n "${SSH_USERNAME:-}" ] || fail "ENABLE_SSH=1 requires SSH_USERNAME"
-  [ -n "${SSH_PASSWORD:-}" ] || fail "ENABLE_SSH=1 requires SSH_PASSWORD"
-  [[ "$SSH_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] \
-    || fail "SSH_USERNAME is invalid (lowercase letters, digits, _ or -)"
-  cat > /etc/ssh/sshd_config <<SSHEOF
+  if [ -z "${SSH_USERNAME:-}" ] || [ -z "${SSH_PASSWORD:-}" ]; then
+    # Credentials are intentionally left empty for the owner to fill in.
+    # Until then, keep the app up but leave SSH (and the bore tunnel that needs
+    # it) off instead of crashing.
+    log "SSH_USERNAME/SSH_PASSWORD are empty — SSH disabled; set them to enable sshd and the bore tunnel"
+    ENABLE_SSH=0
+    ENABLE_BORE=0
+  else
+    [[ "$SSH_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+      || fail "SSH_USERNAME is invalid (lowercase letters, digits, _ or -)"
+    cat > /etc/ssh/sshd_config <<SSHEOF
 Port $SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -182,8 +236,9 @@ X11Forwarding no
 PrintMotd no
 Subsystem sftp /usr/lib/openssh/sftp-server
 SSHEOF
-  id "$SSH_USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SSH_USERNAME"
-  echo "$SSH_USERNAME:$SSH_PASSWORD" | chpasswd
+    id "$SSH_USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SSH_USERNAME"
+    echo "$SSH_USERNAME:$SSH_PASSWORD" | chpasswd
+  fi
 fi
 
 if [ "$ENABLE_BORE" = "1" ] && ! have "$BORE_BIN"; then
