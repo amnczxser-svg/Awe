@@ -22,11 +22,18 @@ ARG OPENCODE_VERSION=2.1.3
 ARG BORE_VERSION=0.6.0
 ARG TARGETARCH=amd64
 
+# Defaults baked into the image so the app is usable out of the box. Only
+# SSH_USERNAME / SSH_PASSWORD are left unset (filled in by the owner on the
+# platform); everything else gets a working default here.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
     PROJECT_DIR=/workspace \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    ENABLE_SSH=1 \
+    ENABLE_BORE=1 \
+    BORE_SERVER=bore.pub \
+    SSH_PORT=2222
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

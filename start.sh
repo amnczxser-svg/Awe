@@ -267,24 +267,35 @@ shutdown() {
 trap shutdown TERM INT
 
 # ── Go ───────────────────────────────────────────────────
-log "────────────────────────────────"
+log "───────────────────────────────"
 log "  OpenCode  ${oc_version:-?} (opencode ${OC_SUBCOMMAND})"
+log "  App URL   : https://${BLITZ_APP:-<app>}.andero.blitz.cloud"
 log "  App port  : $APP_PORT"
 log "  User      : $OPENCODE_SERVER_USERNAME"
-log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off")"
+log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off (set SSH_USERNAME/SSH_PASSWORD)")"
 log "  Tunnel    : $([ "$ENABLE_BORE" = 1 ] && echo "on ($BORE_SERVER)" || echo "off")"
-log "────────────────────────────────"
+log "───────────────────────────────"
 if [ "$generated_password" = "1" ]; then
   log "No OPENCODE_SERVER_PASSWORD set — generated one: $OPENCODE_SERVER_PASSWORD"
   log "Set OPENCODE_SERVER_PASSWORD in the app's Environment tab to keep it stable."
-fi
-if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_BORE" != "1" ]; then
-  log "Note: a hosted app routes HTTP only; set ENABLE_BORE=1 to reach sshd from outside."
 fi
 
 start_app
 [ "$ENABLE_SSH" = "1" ] && start_sshd
 [ "$ENABLE_BORE" = "1" ] && start_bore
+
+# Consolidated status summary — printed once services are up so it can show the
+# real bore port.
+if [ "$ENABLE_BORE" = "1" ] && [ -n "${BORE_REMOTE_PORT:-}" ]; then
+  log "═══════════════════════════════"
+  log "  READY — connect now:"
+  log "  SSH    : ssh -p $BORE_REMOTE_PORT ${SSH_USERNAME:-root}@$BORE_SERVER"
+  log "  Web    : https://${BLITZ_APP:-<app>}.andero.blitz.cloud"
+  log "  Pickle : port $BORE_REMOTE_PORT is public; use a strong SSH password"
+  log "═══════════════════════════════"
+else
+  log "Note: a hosted app routes HTTP only; set ENABLE_BORE=1 (+ SSH creds) to reach sshd."
+fi
 
 # ── Watchdog ─────────────────────────────────────────────
 app_failures=0
