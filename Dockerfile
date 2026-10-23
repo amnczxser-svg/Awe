@@ -62,8 +62,9 @@ WORKDIR /app
 COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh
 
-# Everything OpenCode writes here survives a restart or a new version.
-VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/workspace"]
+# Everything OpenCode writes under HOME (/root) and the project folder survive a
+# restart or a new version.
+VOLUME ["/root", "/workspace"]
 
 WORKDIR /workspace
 
