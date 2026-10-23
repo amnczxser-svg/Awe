@@ -3,8 +3,7 @@
 #  OpenCode supervisor
 #
 #  Default: one HTTP port, taken from $PORT (blitz.cloud sends 8080).
-#  Optional: SSH on 2222, reachable through Tailscale or a bore tunnel.
-#  Everything is opt-in.
+#  Optional: SSH on 2222, reachable through a bore tunnel. Everything opt-in.
 #
 #  Environment:
 #    PORT                      port for the web UI            (default 8080)
@@ -17,16 +16,8 @@
 #    ENABLE_SSH=1              also start sshd on SSH_PORT
 #    SSH_USERNAME / SSH_PASSWORD / SSH_PORT
 #
-#    ENABLE_TAILSCALE=1        join your tailnet from inside the container
-#    TS_AUTHKEY                tailnet auth key (tskey-auth-…, reusable)
-#    TS_HOSTNAME               node name in the tailnet      (default opencode)
-#    TS_STATE_DIR              node key + logs               (default /var/lib/tailscale)
-#    TS_SOCKET                 tailscaled control socket      (default /var/run/tailscale/tailscaled.sock)
-#    TS_SERVE_SSH=1            forward SSH_PORT to sshd over the tailnet
-#    TS_SERVE_APP=1            also forward the web UI as raw TCP over the tailnet
-#
-#    ENABLE_BORE=1             expose SSH_PORT through a bore tunnel (no tailnet
-#                              needed); the public address is printed to the log
+#    ENABLE_BORE=1             expose SSH_PORT through a bore tunnel; the public
+#                              address is printed to the log
 #    BORE_SERVER               tunnel server                 (default bore.pub)
 #    BORE_SECRET               optional secret the server may require
 #    BORE_REMOTE_PORT          ask for a fixed public port    (default: random)
@@ -37,21 +28,12 @@ APP_PORT="${PORT:-8080}"
 SSH_PORT="${SSH_PORT:-2222}"
 PROJECT_DIR="${PROJECT_DIR:-/workspace}"
 ENABLE_SSH="${ENABLE_SSH:-0}"
-ENABLE_TAILSCALE="${ENABLE_TAILSCALE:-0}"
 ENABLE_BORE="${ENABLE_BORE:-0}"
 
 BORE_BIN="${BORE_BIN:-bore}"
 BORE_SERVER="${BORE_SERVER:-bore.pub}"
 BORE_SECRET="${BORE_SECRET:-}"
 BORE_REMOTE_PORT="${BORE_REMOTE_PORT:-}"
-
-TS_AUTHKEY="${TS_AUTHKEY:-}"
-TS_HOSTNAME="${TS_HOSTNAME:-opencode}"
-TS_STATE_DIR="${TS_STATE_DIR:-/var/lib/tailscale}"
-TS_SOCKET="${TS_SOCKET:-/var/run/tailscale/tailscaled.sock}"
-TS_PORT="${TS_PORT:-41641}"
-TS_SERVE_SSH="${TS_SERVE_SSH:-1}"
-TS_SERVE_APP="${TS_SERVE_APP:-0}"
 
 DATA_DIR="${OPENCODE_DATA_DIR:-/root/.local/share/opencode}"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/root/.config/opencode}"
@@ -107,10 +89,7 @@ fi
 
 APP_PID=""
 SSHD_PID=""
-TAILSCALED_PID=""
 BORE_PID=""
-TS_JOINED=0
-TS_RETRY_AT=0
 
 start_app() {
   ( cd "$PROJECT_DIR" 2>/dev/null || cd /; exec "$OC_BIN" "${oc_args[@]}" ) &
@@ -186,77 +165,6 @@ start_bore() {
   return 1
 }
 
-# ── Tailscale ────────────────────────────────────────────
-ts() { tailscale --socket="$TS_SOCKET" "$@"; }
-
-start_tailscaled() {
-  mkdir -p "$TS_STATE_DIR" "$(dirname "$TS_SOCKET")"
-  chmod 700 "$TS_STATE_DIR" 2>/dev/null
-  tailscaled \
-    --tun=userspace-networking \
-    --state="$TS_STATE_DIR/tailscaled.state" \
-    --socket="$TS_SOCKET" \
-    --port="$TS_PORT" \
-    >> "$TS_STATE_DIR/tailscaled.log" 2>&1 &
-  TAILSCALED_PID=$!
-  local i
-  for i in $(seq 1 30); do
-    [ -S "$TS_SOCKET" ] && { log "[tailscale] tailscaled started (pid $TAILSCALED_PID)"; return 0; }
-    kill -0 "$TAILSCALED_PID" 2>/dev/null || break
-    sleep 1
-  done
-  log "[tailscale] tailscaled did not come up — see $TS_STATE_DIR/tailscaled.log"
-  return 1
-}
-
-tailscale_serve() {
-  if [ "$TS_SERVE_SSH" = "1" ]; then
-    if [ "$ENABLE_SSH" = "1" ]; then
-      if ts serve --bg --tcp="$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT" >/dev/null 2>&1; then
-        log "[tailscale] ssh: ssh -p $SSH_PORT ${SSH_USERNAME:-root}@$TS_HOSTNAME"
-      else
-        log "[tailscale] could not forward port $SSH_PORT to sshd"
-      fi
-    else
-      log "[tailscale] TS_SERVE_SSH=1 but ENABLE_SSH=0 — no sshd to forward"
-    fi
-  fi
-  if [ "$TS_SERVE_APP" = "1" ]; then
-    if ts serve --bg --tcp="$APP_PORT" "tcp://127.0.0.1:$APP_PORT" >/dev/null 2>&1; then
-      log "[tailscale] web ui: http://$TS_HOSTNAME:$APP_PORT"
-    else
-      log "[tailscale] could not forward port $APP_PORT"
-    fi
-  fi
-}
-
-tailscale_join() {
-  TS_JOINED=0
-  if ts status >/dev/null 2>&1; then
-    TS_JOINED=1
-    log "[tailscale] already logged in (state in $TS_STATE_DIR)"
-    tailscale_serve
-    return 0
-  fi
-  if [ -z "$TS_AUTHKEY" ]; then
-    log "[tailscale] TS_AUTHKEY is empty — not joining the tailnet"
-    TS_RETRY_AT=$((SECONDS + 60))
-    return 1
-  fi
-  if ts up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
-            --accept-dns=false --timeout=30s >> "$TS_STATE_DIR/tailscaled.log" 2>&1; then
-    TS_JOINED=1
-    local ip
-    ip="$(ts ip -4 2>/dev/null | head -1)"
-    log "[tailscale] joined as ${TS_HOSTNAME}${ip:+ ($ip)}"
-    tailscale_serve
-  else
-    log "[tailscale] join failed — retrying in 60s (see $TS_STATE_DIR/tailscaled.log)"
-    TS_RETRY_AT=$((SECONDS + 60))
-    return 1
-  fi
-}
-
 # ── Optional SSH ─────────────────────────────────────────
 if [ "$ENABLE_SSH" = "1" ]; then
   [ -x /usr/sbin/sshd ] || fail "ENABLE_SSH=1 but /usr/sbin/sshd is missing from the image"
@@ -278,11 +186,6 @@ SSHEOF
   echo "$SSH_USERNAME:$SSH_PASSWORD" | chpasswd
 fi
 
-if [ "$ENABLE_TAILSCALE" = "1" ] && { ! have tailscale || ! have tailscaled; }; then
-  log "[tailscale] tailscale/tailscaled are not in the image — Tailscale disabled"
-  ENABLE_TAILSCALE=0
-fi
-
 if [ "$ENABLE_BORE" = "1" ] && ! have "$BORE_BIN"; then
   log "[bore] $BORE_BIN is not in the image — bore disabled"
   ENABLE_BORE=0
@@ -296,7 +199,7 @@ fi
 shutdown() {
   trap - TERM INT
   log "shutting down"
-  for pid in "$APP_PID" "$SSHD_PID" "$TAILSCALED_PID" "$BORE_PID"; do
+  for pid in "$APP_PID" "$SSHD_PID" "$BORE_PID"; do
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
   done
   wait 2>/dev/null
@@ -310,23 +213,19 @@ log "  OpenCode  ${oc_version:-?} (opencode ${OC_SUBCOMMAND})"
 log "  App port  : $APP_PORT"
 log "  User      : $OPENCODE_SERVER_USERNAME"
 log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off")"
-log "  Tailscale : $([ "$ENABLE_TAILSCALE" = 1 ] && echo "on ($TS_HOSTNAME)" || echo "off")"
 log "  Tunnel    : $([ "$ENABLE_BORE" = 1 ] && echo "on ($BORE_SERVER)" || echo "off")"
 log "────────────────────────────────"
 if [ "$generated_password" = "1" ]; then
   log "No OPENCODE_SERVER_PASSWORD set — generated one: $OPENCODE_SERVER_PASSWORD"
   log "Set OPENCODE_SERVER_PASSWORD in the app's Environment tab to keep it stable."
 fi
-if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_TAILSCALE" != "1" ] && [ "$ENABLE_BORE" != "1" ]; then
-  log "Note: a hosted app routes HTTP only; set ENABLE_TAILSCALE=1 or ENABLE_BORE=1 to reach sshd from outside."
+if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_BORE" != "1" ]; then
+  log "Note: a hosted app routes HTTP only; set ENABLE_BORE=1 to reach sshd from outside."
 fi
 
 start_app
 [ "$ENABLE_SSH" = "1" ] && start_sshd
 [ "$ENABLE_BORE" = "1" ] && start_bore
-if [ "$ENABLE_TAILSCALE" = "1" ]; then
-  start_tailscaled && tailscale_join
-fi
 
 # ── Watchdog ─────────────────────────────────────────────
 app_failures=0
@@ -366,16 +265,5 @@ while :; do
     start_bore
   elif [ "$ENABLE_BORE" = "1" ]; then
     bore_failures=0
-  fi
-
-  if [ "$ENABLE_TAILSCALE" = "1" ]; then
-    if [ -z "$TAILSCALED_PID" ] || ! kill -0 "$TAILSCALED_PID" 2>/dev/null; then
-      log "[tailscale] tailscaled exited — restarting"
-      TS_JOINED=0
-      start_tailscaled && tailscale_join
-    elif [ "$TS_JOINED" != "1" ] && [ "$SECONDS" -ge "$TS_RETRY_AT" ]; then
-      log "[tailscale] retrying join"
-      tailscale_join
-    fi
   fi
 done

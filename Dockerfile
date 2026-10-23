@@ -8,14 +8,9 @@
 #   • OpenCode 2 is served with `opencode serve`; 1.x still works via
 #     `opencode web` (start.sh detects it). `opencode web` does not exist in 2.x
 #     and exits instead of listening — a common "Starting…" hang.
-#   • Only one HTTP port is exposed. SSH is opt-in, and reachable through
-#     Tailscale (bundled, userspace mode — no NET_ADMIN, no /dev/net/tun) or
-#     through a bore tunnel (bundled) when no tailnet is available.
+#   • Only one HTTP port is exposed. SSH is opt-in, and reachable through a
+#     bore tunnel (bundled) when the host routes HTTP only.
 #   • tini is PID 1, so SIGTERM reaches the children and restarts are clean.
-#
-#  Tailscale: blitz.cloud's own "Private network" toggle covers the HTTP
-#  address only. To reach sshd, the container joins your tailnet itself and
-#  forwards port 2222 with `tailscale serve --tcp`.
 #
 #  bore: hosts that route HTTP only cannot expose port 2222 at all. With
 #  ENABLE_BORE=1 the container opens an outbound tunnel to bore.pub and prints
@@ -24,7 +19,6 @@
 FROM ubuntu:24.04
 
 ARG OPENCODE_VERSION=2.1.3
-ARG TAILSCALE_VERSION=1.104.2
 ARG BORE_VERSION=0.6.0
 ARG TARGETARCH=amd64
 
@@ -45,28 +39,12 @@ RUN apt-get update \
        tini \
   && rm -rf /var/lib/apt/lists/* \
   && ssh-keygen -A \
-  && mkdir -p /run/sshd /app /workspace /var/lib/tailscale /var/run/tailscale
+  && mkdir -p /run/sshd /app /workspace
 
 # OpenCode, pinned to a known version and checked right after installing.
 RUN set -eux; \
     curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path; \
     /root/.opencode/bin/opencode --version
-
-# Tailscale static binaries. tailscaled runs with --tun=userspace-networking,
-# so it needs neither NET_ADMIN nor /dev/net/tun — both absent in a gVisor
-# sandbox. Only amd64 and arm64 are published.
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) ts_arch=amd64 ;; \
-      arm64) ts_arch=arm64 ;; \
-      *) echo "Tailscale: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_${ts_arch}.tgz" \
-      | tar -xz -C /usr/local/bin \
-          --strip-components=1 \
-          "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscale" \
-          "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscaled"; \
-    tailscale version | head -1
 
 # bore: a tiny outbound-only tunnel, so sshd can be reached even where the host
 # proxies HTTP only. Installed at build time so start.sh never downloads at boot.
@@ -84,8 +62,8 @@ WORKDIR /app
 COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh
 
-# Everything OpenCode and Tailscale write here survives a restart or a new version.
-VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/workspace", "/var/lib/tailscale"]
+# Everything OpenCode writes here survives a restart or a new version.
+VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/workspace"]
 
 WORKDIR /workspace
 
