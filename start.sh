@@ -149,11 +149,15 @@ start_bore() {
   local args=(local "$SSH_PORT" --local-host 127.0.0.1 --to "$BORE_SERVER")
   [ -n "$BORE_SECRET" ] && args+=(--secret "$BORE_SECRET")
 
-  # Preferred port: env override, else the last one we actually got (persisted),
-  # else leave it empty to let bore pick any free port.
-  requested="$BORE_REMOTE_PORT"
-  if [ -z "$requested" ] && [ -n "$BORE_PORT_FILE" ] && [ -f "$BORE_PORT_FILE" ]; then
+  # Preferred port: the last port we actually got (persisted) wins, so we keep
+  # reusing it while it stays free; fall back to the env override, else let bore
+  # pick any free port.
+  requested=""
+  if [ -n "$BORE_PORT_FILE" ] && [ -f "$BORE_PORT_FILE" ]; then
     requested="$(cat "$BORE_PORT_FILE" 2>/dev/null | tr -dc '0-9')"
+  fi
+  if [ -z "$requested" ]; then
+    requested="${BORE_REMOTE_PORT:-}"
   fi
 
   # Try the requested fixed port first.
