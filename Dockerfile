@@ -4,9 +4,9 @@
 #  OpenCode server (blitz.cloud / Railway / any container host)
 #
 #  What changed compared to the first version:
-#   • OpenCode is installed during the build, pinned — not on every start.
-#     Cold starts after the platform puts the app to sleep no longer depend on
-#     a runtime download, and the version no longer drifts.
+#   • OpenCode is installed during the build with the official installer, so a
+#     rebuild always picks up the latest release. Cold starts after the platform
+#     puts the app to sleep do not download anything at runtime.
 #   • OpenCode 2 is served with `opencode serve`; 1.x still works via
 #     `opencode web` (start.sh detects it). `opencode web` does not exist in 2.x
 #     and exits instead of listening — a common "Starting…" hang.
@@ -20,7 +20,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-ARG OPENCODE_VERSION=2.1.3
 ARG TAILSCALE_VERSION=1.104.2
 ARG TARGETARCH=amd64
 
@@ -43,9 +42,9 @@ RUN apt-get update \
   && ssh-keygen -A \
   && mkdir -p /run/sshd /app /workspace /var/lib/tailscale /var/run/tailscale
 
-# OpenCode, pinned to a known version and checked right after installing.
+# OpenCode, always the latest release, from the official installer.
 RUN set -eux; \
-    curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path; \
+    curl -fsSL https://opencode.ai/v2/install | bash; \
     /root/.opencode/bin/opencode --version
 
 # Tailscale static binaries. tailscaled runs with --tun=userspace-networking,
