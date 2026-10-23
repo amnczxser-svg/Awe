@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  OpenCode server (blitz.cloud / Railway / any container host)
 #
