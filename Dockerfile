@@ -42,9 +42,12 @@ RUN apt-get update \
   && mkdir -p /run/sshd /app /workspace
 
 # OpenCode, pinned to a known version and checked right after installing.
+# /root is a persisted volume, so the binary must live outside it (/usr/local/bin)
+# or it would vanish when the volume remounts on restart.
 RUN set -eux; \
     curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path; \
-    /root/.opencode/bin/opencode --version
+    install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode; \
+    opencode --version
 
 # bore: a tiny outbound-only tunnel, so sshd can be reached even where the host
 # proxies HTTP only. Installed at build time so start.sh never downloads at boot.
@@ -63,7 +66,8 @@ COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh
 
 # Everything OpenCode writes under HOME (/root) and the project folder survive a
-# restart or a new version.
+# restart or a new version. The opencode binary itself lives in /usr/local/bin
+# (outside /root) so it always survives the volume remount.
 VOLUME ["/root", "/workspace"]
 
 WORKDIR /workspace
