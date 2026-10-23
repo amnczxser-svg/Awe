@@ -3,7 +3,8 @@
 #  OpenCode supervisor
 #
 #  Default: one HTTP port, taken from $PORT (blitz.cloud sends 8080).
-#  Optional: SSH on 2222, reachable through Tailscale. Both opt-in.
+#  Optional: SSH on 2222, reachable through Tailscale or a bore tunnel.
+#  Everything is opt-in.
 #
 #  Environment:
 #    PORT                      port for the web UI            (default 8080)
@@ -23,6 +24,12 @@
 #    TS_SOCKET                 tailscaled control socket      (default /var/run/tailscale/tailscaled.sock)
 #    TS_SERVE_SSH=1            forward SSH_PORT to sshd over the tailnet
 #    TS_SERVE_APP=1            also forward the web UI as raw TCP over the tailnet
+#
+#    ENABLE_BORE=1             expose SSH_PORT through a bore tunnel (no tailnet
+#                              needed); the public address is printed to the log
+#    BORE_SERVER               tunnel server                 (default bore.pub)
+#    BORE_SECRET               optional secret the server may require
+#    BORE_REMOTE_PORT          ask for a fixed public port    (default: random)
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -31,6 +38,12 @@ SSH_PORT="${SSH_PORT:-2222}"
 PROJECT_DIR="${PROJECT_DIR:-/workspace}"
 ENABLE_SSH="${ENABLE_SSH:-0}"
 ENABLE_TAILSCALE="${ENABLE_TAILSCALE:-0}"
+ENABLE_BORE="${ENABLE_BORE:-0}"
+
+BORE_BIN="${BORE_BIN:-bore}"
+BORE_SERVER="${BORE_SERVER:-bore.pub}"
+BORE_SECRET="${BORE_SECRET:-}"
+BORE_REMOTE_PORT="${BORE_REMOTE_PORT:-}"
 
 TS_AUTHKEY="${TS_AUTHKEY:-}"
 TS_HOSTNAME="${TS_HOSTNAME:-opencode}"
@@ -95,6 +108,7 @@ fi
 APP_PID=""
 SSHD_PID=""
 TAILSCALED_PID=""
+BORE_PID=""
 TS_JOINED=0
 TS_RETRY_AT=0
 
@@ -116,6 +130,38 @@ start_sshd() {
     log "[sshd] failed to start — check /etc/ssh/sshd_config and the host keys"
     SSHD_PID=""
   fi
+}
+
+# ── bore tunnel ──────────────────────────────────────────
+# A host that routes HTTP only cannot publish port 2222. bore holds an outbound
+# connection to a public server and gives back a port on it, so
+# `ssh -p <port> root@bore.pub` works from anywhere, with no tailnet.
+bore_public_address() {
+  sed -e 's/\x1b\[[0-9;]*m//g' "${1:-/tmp/bore.log}" 2>/dev/null \
+    | grep -oE 'listening at [^ ]+:[0-9]+' | tail -1 | awk '{print $3}'
+}
+
+start_bore() {
+  local logfile=/tmp/bore.log addr i
+  : > "$logfile"
+  local args=(local "$SSH_PORT" --local-host 127.0.0.1 --to "$BORE_SERVER")
+  [ -n "$BORE_SECRET" ] && args+=(--secret "$BORE_SECRET")
+  [ -n "$BORE_REMOTE_PORT" ] && args+=(--port "$BORE_REMOTE_PORT")
+  NO_COLOR=1 "$BORE_BIN" "${args[@]}" >> "$logfile" 2>&1 &
+  BORE_PID=$!
+  for i in $(seq 1 20); do
+    addr="$(bore_public_address "$logfile")"
+    if [ -n "$addr" ]; then
+      log "[bore] ssh: ssh -p ${addr##*:} ${SSH_USERNAME:-root}@${addr%:*}"
+      log "[bore] that port is on the open internet — use a long password or keys"
+      return 0
+    fi
+    kill -0 "$BORE_PID" 2>/dev/null || break
+    sleep 1
+  done
+  log "[bore] could not open a tunnel to $BORE_SERVER — see $logfile"
+  BORE_PID=""
+  return 1
 }
 
 # ── Tailscale ────────────────────────────────────────────
@@ -215,11 +261,20 @@ if [ "$ENABLE_TAILSCALE" = "1" ] && { ! have tailscale || ! have tailscaled; }; 
   ENABLE_TAILSCALE=0
 fi
 
+if [ "$ENABLE_BORE" = "1" ] && ! have "$BORE_BIN"; then
+  log "[bore] $BORE_BIN is not in the image — bore disabled"
+  ENABLE_BORE=0
+fi
+if [ "$ENABLE_BORE" = "1" ] && [ "$ENABLE_SSH" != "1" ]; then
+  log "[bore] ENABLE_BORE=1 needs ENABLE_SSH=1 — there is nothing to forward"
+  ENABLE_BORE=0
+fi
+
 # ── Shutdown ─────────────────────────────────────────────
 shutdown() {
   trap - TERM INT
   log "shutting down"
-  for pid in "$APP_PID" "$SSHD_PID" "$TAILSCALED_PID"; do
+  for pid in "$APP_PID" "$SSHD_PID" "$TAILSCALED_PID" "$BORE_PID"; do
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
   done
   wait 2>/dev/null
@@ -234,17 +289,19 @@ log "  App port  : $APP_PORT"
 log "  User      : $OPENCODE_SERVER_USERNAME"
 log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off")"
 log "  Tailscale : $([ "$ENABLE_TAILSCALE" = 1 ] && echo "on ($TS_HOSTNAME)" || echo "off")"
+log "  Tunnel    : $([ "$ENABLE_BORE" = 1 ] && echo "on ($BORE_SERVER)" || echo "off")"
 log "────────────────────────────────"
 if [ "$generated_password" = "1" ]; then
   log "No OPENCODE_SERVER_PASSWORD set — generated one: $OPENCODE_SERVER_PASSWORD"
   log "Set OPENCODE_SERVER_PASSWORD in the app's Environment tab to keep it stable."
 fi
-if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_TAILSCALE" != "1" ]; then
-  log "Note: a hosted app routes HTTP only; set ENABLE_TAILSCALE=1 to reach sshd over your tailnet."
+if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_TAILSCALE" != "1" ] && [ "$ENABLE_BORE" != "1" ]; then
+  log "Note: a hosted app routes HTTP only; set ENABLE_TAILSCALE=1 or ENABLE_BORE=1 to reach sshd from outside."
 fi
 
 start_app
 [ "$ENABLE_SSH" = "1" ] && start_sshd
+[ "$ENABLE_BORE" = "1" ] && start_bore
 if [ "$ENABLE_TAILSCALE" = "1" ]; then
   start_tailscaled && tailscale_join
 fi
@@ -252,6 +309,7 @@ fi
 # ── Watchdog ─────────────────────────────────────────────
 app_failures=0
 sshd_failures=0
+bore_failures=0
 while :; do
   sleep 5
 
@@ -275,6 +333,17 @@ while :; do
     start_sshd
   elif [ "$ENABLE_SSH" = "1" ]; then
     sshd_failures=0
+  fi
+
+  if [ "$ENABLE_BORE" = "1" ] && { [ -z "$BORE_PID" ] || ! kill -0 "$BORE_PID" 2>/dev/null; }; then
+    bore_failures=$((bore_failures + 1))
+    delay=$((bore_failures * 5))
+    [ "$delay" -gt 60 ] && delay=60
+    log "[bore] tunnel exited — reopening in ${delay}s"
+    sleep "$delay"
+    start_bore
+  elif [ "$ENABLE_BORE" = "1" ]; then
+    bore_failures=0
   fi
 
   if [ "$ENABLE_TAILSCALE" = "1" ]; then

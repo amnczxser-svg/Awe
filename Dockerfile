@@ -9,17 +9,23 @@
 #     `opencode web` (start.sh detects it). `opencode web` does not exist in 2.x
 #     and exits instead of listening — a common "Starting…" hang.
 #   • Only one HTTP port is exposed. SSH is opt-in, and reachable through
-#     Tailscale (bundled, userspace mode — no NET_ADMIN, no /dev/net/tun).
+#     Tailscale (bundled, userspace mode — no NET_ADMIN, no /dev/net/tun) or
+#     through a bore tunnel (bundled) when no tailnet is available.
 #   • tini is PID 1, so SIGTERM reaches the children and restarts are clean.
 #
 #  Tailscale: blitz.cloud's own "Private network" toggle covers the HTTP
 #  address only. To reach sshd, the container joins your tailnet itself and
 #  forwards port 2222 with `tailscale serve --tcp`.
+#
+#  bore: hosts that route HTTP only cannot expose port 2222 at all. With
+#  ENABLE_BORE=1 the container opens an outbound tunnel to bore.pub and prints
+#  the public port to connect to: ssh -p <port> root@bore.pub
 # ─────────────────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
 ARG OPENCODE_VERSION=2.1.3
 ARG TAILSCALE_VERSION=1.104.2
+ARG BORE_VERSION=0.6.0
 ARG TARGETARCH=amd64
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -61,6 +67,18 @@ RUN set -eux; \
           "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscale" \
           "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscaled"; \
     tailscale version | head -1
+
+# bore: a tiny outbound-only tunnel, so sshd can be reached even where the host
+# proxies HTTP only. Installed at build time so start.sh never downloads at boot.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) bore_arch=x86_64-unknown-linux-musl ;; \
+      arm64) bore_arch=aarch64-unknown-linux-musl ;; \
+      *) echo "bore: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-${bore_arch}.tar.gz" \
+      | tar -xz -C /usr/local/bin bore; \
+    bore --version
 
 WORKDIR /app
 COPY start.sh /app/start.sh
