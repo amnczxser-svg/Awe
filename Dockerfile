@@ -29,7 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
     PROJECT_DIR=/workspace \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     ENABLE_SSH=1 \
     ENABLE_BORE=1 \
     BORE_SERVER=bore.pub \
@@ -48,12 +48,19 @@ RUN apt-get update \
   && ssh-keygen -A \
   && mkdir -p /run/sshd /app /workspace
 
-# OpenCode, pinned to a known version and checked right after installing.
-# /root is a persisted volume, so the binary must live outside it (/usr/local/bin)
-# or it would vanish when the volume remounts on restart.
+# OpenCode, as the official prebuilt binary, downloaded directly from the npm
+# registry (same artifact the installer uses), pinned. No installer script, no
+# extra files under /root — the binary lands straight in /usr/local/bin, which
+# is outside the persisted volumes so it always survives a restart.
 RUN set -eux; \
-    curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path; \
-    install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode; \
+    case "${TARGETARCH}" in \
+      amd64) oc_arch=x64 ;; \
+      arm64) oc_arch=arm64 ;; \
+      *) echo "opencode: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-${oc_arch}/-/cli-linux-${oc_arch}-${OPENCODE_VERSION}.tgz" \
+      | tar -xz -C /usr/local/bin --strip-components=2 package/bin/opencode; \
+    chmod 0755 /usr/local/bin/opencode; \
     opencode --version
 
 # bore: a tiny outbound-only tunnel, so sshd can be reached even where the host
