@@ -1,5 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  OpenCode server (blitz.cloud / Railway / any container host)
+#  (build-on-own-github-actions test marker)
 #
 #  What changed compared to the first version:
 #   • OpenCode is installed during the build, pinned — not on every start.
