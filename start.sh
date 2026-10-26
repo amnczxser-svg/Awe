@@ -39,7 +39,7 @@ BORE_BIN="${BORE_BIN:-bore}"
 BORE_SERVER="${BORE_SERVER:-bore.pub}"
 BORE_SECRET="${BORE_SECRET:-}"
 BORE_REMOTE_PORT="${BORE_REMOTE_PORT:-}"
-BORE_PORT_FILE="${BORE_PORT_FILE:-${PROJECT_DIR}/.bore_remote_port}"
+BORE_PORT_FILE="${BORE_PORT_FILE:-/root/.local/share/opencode/.bore_remote_port}"
 # Optional: if set, the script self-syncs BORE_REMOTE_PORT on the platform when
 # it changes, so the app's Environment tab always shows the port actually in use.
 BLITZ_API_KEY="${BLITZ_API_KEY:-}"
