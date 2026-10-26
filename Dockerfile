@@ -1,32 +1,40 @@
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  OpenCode server (blitz.cloud / Railway / any container host)
+#  (build-on-own-github-actions test marker)
 #
 #  What changed compared to the first version:
-#   • OpenCode is installed during the build with the official installer, so a
-#     rebuild always picks up the latest release. Cold starts after the platform
-#     puts the app to sleep do not download anything at runtime.
+#   • OpenCode is installed during the build, pinned — not on every start.
+#     Cold starts after the platform puts the app to sleep no longer depend on
+#     a runtime download, and the version no longer drifts.
 #   • OpenCode 2 is served with `opencode serve`; 1.x still works via
 #     `opencode web` (start.sh detects it). `opencode web` does not exist in 2.x
 #     and exits instead of listening — a common "Starting…" hang.
-#   • Only one HTTP port is exposed. SSH is opt-in, and reachable through
-#     Tailscale (bundled, userspace mode — no NET_ADMIN, no /dev/net/tun).
+#   • Only one HTTP port is exposed. SSH is opt-in, and reachable through a
+#     bore tunnel (bundled) when the host routes HTTP only.
 #   • tini is PID 1, so SIGTERM reaches the children and restarts are clean.
 #
-#  Tailscale: blitz.cloud's own "Private network" toggle covers the HTTP
-#  address only. To reach sshd, the container joins your tailnet itself and
-#  forwards port 2222 with `tailscale serve --tcp`.
+#  bore: hosts that route HTTP only cannot expose port 2222 at all. With
+#  ENABLE_BORE=1 the container opens an outbound tunnel to bore.pub and prints
+#  the public port to connect to: ssh -p <port> root@bore.pub
 # ─────────────────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-ARG TAILSCALE_VERSION=1.104.2
+ARG OPENCODE_VERSION=2.1.3
+ARG BORE_VERSION=0.6.0
 ARG TARGETARCH=amd64
 
+# Defaults baked into the image so the app is usable out of the box. Only
+# SSH_USERNAME / SSH_PASSWORD are left unset (filled in by the owner on the
+# platform); everything else gets a working default here.
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
     PROJECT_DIR=/workspace \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    ENABLE_SSH=1 \
+    ENABLE_BORE=1 \
+    BORE_SERVER=bore.pub \
+    SSH_PORT=2222
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -39,35 +47,42 @@ RUN apt-get update \
        tini \
   && rm -rf /var/lib/apt/lists/* \
   && ssh-keygen -A \
-  && mkdir -p /run/sshd /app /workspace /var/lib/tailscale /var/run/tailscale
+  && mkdir -p /run/sshd /app /workspace
 
-# OpenCode, always the latest release, from the official installer.
-RUN set -eux; \
-    curl -fsSL https://opencode.ai/v2/install | bash; \
-    /root/.opencode/bin/opencode --version
-
-# Tailscale static binaries. tailscaled runs with --tun=userspace-networking,
-# so it needs neither NET_ADMIN nor /dev/net/tun — both absent in a gVisor
-# sandbox. Only amd64 and arm64 are published.
+# OpenCode, as the official prebuilt binary, downloaded directly from the npm
+# registry (same artifact the installer uses), pinned. No installer script, no
+# extra files under /root — the binary lands straight in /usr/local/bin, which
+# is outside the persisted volumes so it always survives a restart.
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64) ts_arch=amd64 ;; \
-      arm64) ts_arch=arm64 ;; \
-      *) echo "Tailscale: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+      amd64) oc_arch=x64 ;; \
+      arm64) oc_arch=arm64 ;; \
+      *) echo "opencode: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_${ts_arch}.tgz" \
-      | tar -xz -C /usr/local/bin \
-          --strip-components=1 \
-          "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscale" \
-          "tailscale_${TAILSCALE_VERSION}_${ts_arch}/tailscaled"; \
-    tailscale version | head -1
+    curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-${oc_arch}/-/cli-linux-${oc_arch}-${OPENCODE_VERSION}.tgz" \
+      | tar -xz -C /usr/local/bin --strip-components=2 package/bin/opencode; \
+    chmod 0755 /usr/local/bin/opencode; \
+    opencode --version
+
+# bore: a tiny outbound-only tunnel, so sshd can be reached even where the host
+# proxies HTTP only. Installed at build time so start.sh never downloads at boot.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) bore_arch=x86_64-unknown-linux-musl ;; \
+      arm64) bore_arch=aarch64-unknown-linux-musl ;; \
+      *) echo "bore: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-${bore_arch}.tar.gz" \
+      | tar -xz -C /usr/local/bin bore; \
+    bore --version
 
 WORKDIR /app
 COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh
 
-# Everything OpenCode and Tailscale write here survives a restart or a new version.
-VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/workspace", "/var/lib/tailscale"]
+# Everything OpenCode writes under its data/config dirs and the user's zxc
+# folder survive a restart or a new version.
+VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/root/zxc"]
 
 WORKDIR /workspace
 
