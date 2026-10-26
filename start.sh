@@ -3,7 +3,7 @@
 #  OpenCode supervisor
 #
 #  Default: one HTTP port, taken from $PORT (blitz.cloud sends 8080).
-#  Optional: SSH on 2222, reachable through Tailscale. Both opt-in.
+#  Optional: SSH on 2222, reachable through a bore tunnel. Everything opt-in.
 #
 #  Environment:
 #    PORT                      port for the web UI            (default 8080)
@@ -16,13 +16,16 @@
 #    ENABLE_SSH=1              also start sshd on SSH_PORT
 #    SSH_USERNAME / SSH_PASSWORD / SSH_PORT
 #
-#    ENABLE_TAILSCALE=1        join your tailnet from inside the container
-#    TS_AUTHKEY                tailnet auth key (tskey-auth-…, reusable)
-#    TS_HOSTNAME               node name in the tailnet      (default opencode)
-#    TS_STATE_DIR              node key + logs               (default /var/lib/tailscale)
-#    TS_SOCKET                 tailscaled control socket      (default /var/run/tailscale/tailscaled.sock)
-#    TS_SERVE_SSH=1            forward SSH_PORT to sshd over the tailnet
-#    TS_SERVE_APP=1            also forward the web UI as raw TCP over the tailnet
+#    ENABLE_BORE=1             expose SSH_PORT through a bore tunnel; the public
+#                              address is printed to the log
+#    BORE_SERVER               tunnel server                 (default bore.pub)
+#    BORE_SECRET               optional secret the server may require
+#    BORE_REMOTE_PORT          preferred fixed public port (default: random).
+#                              If the preferred port is taken bore picks a free
+#                              one and the actually-used port is saved back here
+#                              (via $BORE_PORT_FILE) so later restarts reuse it.
+#    BORE_PORT_FILE            where the last-used port is kept
+#                              (default $PROJECT_DIR/.bore_remote_port)
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -30,15 +33,17 @@ APP_PORT="${PORT:-8080}"
 SSH_PORT="${SSH_PORT:-2222}"
 PROJECT_DIR="${PROJECT_DIR:-/workspace}"
 ENABLE_SSH="${ENABLE_SSH:-0}"
-ENABLE_TAILSCALE="${ENABLE_TAILSCALE:-0}"
+ENABLE_BORE="${ENABLE_BORE:-0}"
 
-TS_AUTHKEY="${TS_AUTHKEY:-}"
-TS_HOSTNAME="${TS_HOSTNAME:-opencode}"
-TS_STATE_DIR="${TS_STATE_DIR:-/var/lib/tailscale}"
-TS_SOCKET="${TS_SOCKET:-/var/run/tailscale/tailscaled.sock}"
-TS_PORT="${TS_PORT:-41641}"
-TS_SERVE_SSH="${TS_SERVE_SSH:-1}"
-TS_SERVE_APP="${TS_SERVE_APP:-0}"
+BORE_BIN="${BORE_BIN:-bore}"
+BORE_SERVER="${BORE_SERVER:-bore.pub}"
+BORE_SECRET="${BORE_SECRET:-}"
+BORE_REMOTE_PORT="${BORE_REMOTE_PORT:-}"
+BORE_PORT_FILE="${BORE_PORT_FILE:-/root/.local/share/opencode/.bore_remote_port}"
+# Optional: if set, the script self-syncs BORE_REMOTE_PORT on the platform when
+# it changes, so the app's Environment tab always shows the port actually in use.
+BLITZ_API_KEY="${BLITZ_API_KEY:-}"
+BLITZ_APP="${BLITZ_APP:-}"
 
 DATA_DIR="${OPENCODE_DATA_DIR:-/root/.local/share/opencode}"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-/root/.config/opencode}"
@@ -94,9 +99,7 @@ fi
 
 APP_PID=""
 SSHD_PID=""
-TAILSCALED_PID=""
-TS_JOINED=0
-TS_RETRY_AT=0
+BORE_PID=""
 
 start_app() {
   ( cd "$PROJECT_DIR" 2>/dev/null || cd /; exec "$OC_BIN" "${oc_args[@]}" ) &
@@ -118,85 +121,116 @@ start_sshd() {
   fi
 }
 
-# ── Tailscale ────────────────────────────────────────────
-ts() { tailscale --socket="$TS_SOCKET" "$@"; }
-
-start_tailscaled() {
-  mkdir -p "$TS_STATE_DIR" "$(dirname "$TS_SOCKET")"
-  chmod 700 "$TS_STATE_DIR" 2>/dev/null
-  tailscaled \
-    --tun=userspace-networking \
-    --state="$TS_STATE_DIR/tailscaled.state" \
-    --socket="$TS_SOCKET" \
-    --port="$TS_PORT" \
-    >> "$TS_STATE_DIR/tailscaled.log" 2>&1 &
-  TAILSCALED_PID=$!
-  local i
-  for i in $(seq 1 30); do
-    [ -S "$TS_SOCKET" ] && { log "[tailscale] tailscaled started (pid $TAILSCALED_PID)"; return 0; }
-    kill -0 "$TAILSCALED_PID" 2>/dev/null || break
-    sleep 1
-  done
-  log "[tailscale] tailscaled did not come up — see $TS_STATE_DIR/tailscaled.log"
-  return 1
+# ── bore tunnel ──────────────────────────────────────────
+# A host that routes HTTP only cannot publish port 2222. bore holds an outbound
+# connection to a public server and gives back a port on it, so
+# `ssh -p <port> root@bore.pub` works from anywhere, with no tailnet.
+bore_public_address() {
+  sed -e 's/\x1b\[[0-9;]*m//g' "${1:-/tmp/bore.log}" 2>/dev/null \
+    | grep -oE 'listening at [^ ]+:[0-9]+' | tail -1 | awk '{print $3}'
 }
 
-tailscale_serve() {
-  if [ "$TS_SERVE_SSH" = "1" ]; then
-    if [ "$ENABLE_SSH" = "1" ]; then
-      if ts serve --bg --tcp="$SSH_PORT" "tcp://127.0.0.1:$SSH_PORT" >/dev/null 2>&1; then
-        log "[tailscale] ssh: ssh -p $SSH_PORT ${SSH_USERNAME:-root}@$TS_HOSTNAME"
-      else
-        log "[tailscale] could not forward port $SSH_PORT to sshd"
+# Push the actual port back to the platform's BORE_REMOTE_PORT setting so the
+# app's Environment tab stays in sync even after a fallback to a random port.
+bore_sync_platform_port() {
+  local port="$1"
+  [ -n "$BLITZ_API_KEY" ] && [ -n "$BLITZ_APP" ] || return 0
+  curl -sS --max-time 15 -X POST "https://mcp.blitz.cloud/cli" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Authorization: Bearer ${BLITZ_API_KEY}" \
+    -H "Mcp-Protocol-Version: 2025-06-18" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"env_set\",\"arguments\":{\"app\":\"${BLITZ_APP}\",\"name\":\"BORE_REMOTE_PORT\",\"value\":\"${port}\"}}}" \
+    >/dev/null 2>&1
+}
+
+start_bore() {
+  local logfile=/tmp/bore.log addr i actual requested
+  local args=(local "$SSH_PORT" --local-host 127.0.0.1 --to "$BORE_SERVER")
+  [ -n "$BORE_SECRET" ] && args+=(--secret "$BORE_SECRET")
+
+  # Preferred port: the last port we actually got (persisted) wins, so we keep
+  # reusing it while it stays free; fall back to the env override, else let bore
+  # pick any free port.
+  requested=""
+  if [ -n "$BORE_PORT_FILE" ] && [ -f "$BORE_PORT_FILE" ]; then
+    requested="$(cat "$BORE_PORT_FILE" 2>/dev/null | tr -dc '0-9')"
+  fi
+  if [ -z "$requested" ]; then
+    requested="${BORE_REMOTE_PORT:-}"
+  fi
+
+  # Try the requested fixed port first.
+  if [ -n "$requested" ]; then
+    : > "$logfile"
+    NO_COLOR=1 "$BORE_BIN" "${args[@]}" --port "$requested" >> "$logfile" 2>&1 &
+    BORE_PID=$!
+    for i in $(seq 1 8); do
+      addr="$(bore_public_address "$logfile")"
+      [ -n "$addr" ] && break
+      kill -0 "$BORE_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if [ -n "$addr" ] && [ "${addr##*:}" = "$requested" ]; then
+      actual="$requested"
+    else
+      log "[bore] requested port $requested is not free — asking for any free port instead"
+      kill "$BORE_PID" 2>/dev/null
+      BORE_PID=""
+      # "No" a stale requested port so the random path below does not redo this.
+      requested=""
+    fi
+  fi
+
+  # Random port fallback (no preferred port, or the preferred one was taken).
+  if [ -z "$requested" ]; then
+    : > "$logfile"
+    NO_COLOR=1 "$BORE_BIN" "${args[@]}" >> "$logfile" 2>&1 &
+    BORE_PID=$!
+    for i in $(seq 1 20); do
+      addr="$(bore_public_address "$logfile")"
+      [ -n "$addr" ] && break
+      kill -0 "$BORE_PID" 2>/dev/null || break
+      sleep 1
+    done
+  fi
+
+  if [ -n "$addr" ]; then
+    actual="${addr##*:}"
+    # Keep the port we actually got so later restarts reuse the same one while it
+    # stays free, instead of getting a new random port every time.
+    if [ "$actual" != "$BORE_REMOTE_PORT" ]; then
+      BORE_REMOTE_PORT="$actual"
+      if [ -n "$BORE_PORT_FILE" ]; then
+        mkdir -p "$(dirname "$BORE_PORT_FILE")" 2>/dev/null
+        printf '%s\n' "$actual" > "$BORE_PORT_FILE" 2>/dev/null
       fi
-    else
-      log "[tailscale] TS_SERVE_SSH=1 but ENABLE_SSH=0 — no sshd to forward"
+      bore_sync_platform_port "$actual"
     fi
-  fi
-  if [ "$TS_SERVE_APP" = "1" ]; then
-    if ts serve --bg --tcp="$APP_PORT" "tcp://127.0.0.1:$APP_PORT" >/dev/null 2>&1; then
-      log "[tailscale] web ui: http://$TS_HOSTNAME:$APP_PORT"
-    else
-      log "[tailscale] could not forward port $APP_PORT"
-    fi
-  fi
-}
-
-tailscale_join() {
-  TS_JOINED=0
-  if ts status >/dev/null 2>&1; then
-    TS_JOINED=1
-    log "[tailscale] already logged in (state in $TS_STATE_DIR)"
-    tailscale_serve
+    log "[bore] ssh: ssh -p $actual ${SSH_USERNAME:-root}@${addr%:*}"
+    log "[bore] using fixed port $actual (kept across restarts while it stays free)"
     return 0
   fi
-  if [ -z "$TS_AUTHKEY" ]; then
-    log "[tailscale] TS_AUTHKEY is empty — not joining the tailnet"
-    TS_RETRY_AT=$((SECONDS + 60))
-    return 1
-  fi
-  if ts up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
-            --accept-dns=false --timeout=30s >> "$TS_STATE_DIR/tailscaled.log" 2>&1; then
-    TS_JOINED=1
-    local ip
-    ip="$(ts ip -4 2>/dev/null | head -1)"
-    log "[tailscale] joined as ${TS_HOSTNAME}${ip:+ ($ip)}"
-    tailscale_serve
-  else
-    log "[tailscale] join failed — retrying in 60s (see $TS_STATE_DIR/tailscaled.log)"
-    TS_RETRY_AT=$((SECONDS + 60))
-    return 1
-  fi
+
+  log "[bore] could not open a tunnel to $BORE_SERVER — see $logfile"
+  BORE_PID=""
+  return 1
 }
 
 # ── Optional SSH ─────────────────────────────────────────
 if [ "$ENABLE_SSH" = "1" ]; then
   [ -x /usr/sbin/sshd ] || fail "ENABLE_SSH=1 but /usr/sbin/sshd is missing from the image"
-  [ -n "${SSH_USERNAME:-}" ] || fail "ENABLE_SSH=1 requires SSH_USERNAME"
-  [ -n "${SSH_PASSWORD:-}" ] || fail "ENABLE_SSH=1 requires SSH_PASSWORD"
-  [[ "$SSH_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] \
-    || fail "SSH_USERNAME is invalid (lowercase letters, digits, _ or -)"
-  cat > /etc/ssh/sshd_config <<SSHEOF
+  if [ -z "${SSH_USERNAME:-}" ] || [ -z "${SSH_PASSWORD:-}" ]; then
+    # Credentials are intentionally left empty for the owner to fill in.
+    # Until then, keep the app up but leave SSH (and the bore tunnel that needs
+    # it) off instead of crashing.
+    log "SSH_USERNAME/SSH_PASSWORD are empty — SSH disabled; set them to enable sshd and the bore tunnel"
+    ENABLE_SSH=0
+    ENABLE_BORE=0
+  else
+    [[ "$SSH_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+      || fail "SSH_USERNAME is invalid (lowercase letters, digits, _ or -)"
+    cat > /etc/ssh/sshd_config <<SSHEOF
 Port $SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -206,20 +240,25 @@ X11Forwarding no
 PrintMotd no
 Subsystem sftp /usr/lib/openssh/sftp-server
 SSHEOF
-  id "$SSH_USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SSH_USERNAME"
-  echo "$SSH_USERNAME:$SSH_PASSWORD" | chpasswd
+    id "$SSH_USERNAME" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SSH_USERNAME"
+    echo "$SSH_USERNAME:$SSH_PASSWORD" | chpasswd
+  fi
 fi
 
-if [ "$ENABLE_TAILSCALE" = "1" ] && { ! have tailscale || ! have tailscaled; }; then
-  log "[tailscale] tailscale/tailscaled are not in the image — Tailscale disabled"
-  ENABLE_TAILSCALE=0
+if [ "$ENABLE_BORE" = "1" ] && ! have "$BORE_BIN"; then
+  log "[bore] $BORE_BIN is not in the image — bore disabled"
+  ENABLE_BORE=0
+fi
+if [ "$ENABLE_BORE" = "1" ] && [ "$ENABLE_SSH" != "1" ]; then
+  log "[bore] ENABLE_BORE=1 needs ENABLE_SSH=1 — there is nothing to forward"
+  ENABLE_BORE=0
 fi
 
 # ── Shutdown ─────────────────────────────────────────────
 shutdown() {
   trap - TERM INT
   log "shutting down"
-  for pid in "$APP_PID" "$SSHD_PID" "$TAILSCALED_PID"; do
+  for pid in "$APP_PID" "$SSHD_PID" "$BORE_PID"; do
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
   done
   wait 2>/dev/null
@@ -228,30 +267,40 @@ shutdown() {
 trap shutdown TERM INT
 
 # ── Go ───────────────────────────────────────────────────
-log "────────────────────────────────"
+log "───────────────────────────────"
 log "  OpenCode  ${oc_version:-?} (opencode ${OC_SUBCOMMAND})"
+log "  App URL   : https://${BLITZ_APP:-<app>}.andero.blitz.cloud"
 log "  App port  : $APP_PORT"
 log "  User      : $OPENCODE_SERVER_USERNAME"
-log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off")"
-log "  Tailscale : $([ "$ENABLE_TAILSCALE" = 1 ] && echo "on ($TS_HOSTNAME)" || echo "off")"
-log "────────────────────────────────"
+log "  SSH       : $([ "$ENABLE_SSH" = 1 ] && echo "on :$SSH_PORT" || echo "off (set SSH_USERNAME/SSH_PASSWORD)")"
+log "  Tunnel    : $([ "$ENABLE_BORE" = 1 ] && echo "on ($BORE_SERVER)" || echo "off")"
+log "───────────────────────────────"
 if [ "$generated_password" = "1" ]; then
   log "No OPENCODE_SERVER_PASSWORD set — generated one: $OPENCODE_SERVER_PASSWORD"
   log "Set OPENCODE_SERVER_PASSWORD in the app's Environment tab to keep it stable."
 fi
-if [ "$ENABLE_SSH" = "1" ] && [ "$ENABLE_TAILSCALE" != "1" ]; then
-  log "Note: a hosted app routes HTTP only; set ENABLE_TAILSCALE=1 to reach sshd over your tailnet."
-fi
 
 start_app
 [ "$ENABLE_SSH" = "1" ] && start_sshd
-if [ "$ENABLE_TAILSCALE" = "1" ]; then
-  start_tailscaled && tailscale_join
+[ "$ENABLE_BORE" = "1" ] && start_bore
+
+# Consolidated status summary — printed once services are up so it can show the
+# real bore port.
+if [ "$ENABLE_BORE" = "1" ] && [ -n "${BORE_REMOTE_PORT:-}" ]; then
+  log "═══════════════════════════════"
+  log "  READY — connect now:"
+  log "  SSH    : ssh -p $BORE_REMOTE_PORT ${SSH_USERNAME:-root}@$BORE_SERVER"
+  log "  Web    : https://${BLITZ_APP:-<app>}.andero.blitz.cloud"
+  log "  Pickle : port $BORE_REMOTE_PORT is public; use a strong SSH password"
+  log "═══════════════════════════════"
+else
+  log "Note: a hosted app routes HTTP only; set ENABLE_BORE=1 (+ SSH creds) to reach sshd."
 fi
 
 # ── Watchdog ─────────────────────────────────────────────
 app_failures=0
 sshd_failures=0
+bore_failures=0
 while :; do
   sleep 5
 
@@ -277,14 +326,14 @@ while :; do
     sshd_failures=0
   fi
 
-  if [ "$ENABLE_TAILSCALE" = "1" ]; then
-    if [ -z "$TAILSCALED_PID" ] || ! kill -0 "$TAILSCALED_PID" 2>/dev/null; then
-      log "[tailscale] tailscaled exited — restarting"
-      TS_JOINED=0
-      start_tailscaled && tailscale_join
-    elif [ "$TS_JOINED" != "1" ] && [ "$SECONDS" -ge "$TS_RETRY_AT" ]; then
-      log "[tailscale] retrying join"
-      tailscale_join
-    fi
+  if [ "$ENABLE_BORE" = "1" ] && { [ -z "$BORE_PID" ] || ! kill -0 "$BORE_PID" 2>/dev/null; }; then
+    bore_failures=$((bore_failures + 1))
+    delay=$((bore_failures * 5))
+    [ "$delay" -gt 60 ] && delay=60
+    log "[bore] tunnel exited — reopening in ${delay}s"
+    sleep "$delay"
+    start_bore
+  elif [ "$ENABLE_BORE" = "1" ]; then
+    bore_failures=0
   fi
 done
