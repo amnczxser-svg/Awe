@@ -80,9 +80,8 @@ WORKDIR /app
 COPY start.sh /app/start.sh
 RUN chmod 0755 /app/start.sh
 
-# Everything OpenCode writes under its data/config dirs and the user's zxc
-# folder survive a restart or a new version.
-VOLUME ["/root/.local/share/opencode", "/root/.config/opencode", "/root/zxc"]
+# Persistence: attach a Railway Volume (e.g. mounted at /root/zxc) in the
+# Railway dashboard. The Dockerfile VOLUME instruction is not supported.
 
 WORKDIR /workspace
 
